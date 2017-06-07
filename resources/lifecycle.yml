@@ -1,0 +1,98 @@
+#
+# - state-machine controlling a gnatsd process
+#
+initial: setup
+terminal: shutdown
+states:
+- tag: setup
+  shell: |
+
+    #
+    # - make sure /data is there
+    # - add a logrotate configuration block as NATS
+    #   will not do it
+    #
+    mkdir -p /data
+    cat << EOT >> /etc/logrotate.d/gnatsd.conf
+    /data/gnatsd.log {
+        size 1M
+        rotate 5
+        compress
+        missingok
+        notifempty
+        postrotate
+            kill -SIGUSR1 $(cat /data/gnatsd.pid)   
+        endscript
+    }
+    EOT
+
+    #
+    # - append the statsd telegraf input
+    # - start telegraf
+    #
+    cat << EOT >> /etc/telegraf/telegraf.conf
+    [[inputs.statsd]]
+      service_address = "127.0.0.1:8125"
+    EOT
+    supervisorctl start telegraf
+
+  next:
+    - configure
+
+- tag: configure
+  shell: |
+
+    #
+    # - the latest kontrol payload is passed by the callback as $INPUT
+    # - use the peer broker IP addresses to render our NATS configuration file
+    #
+    # @todo potentially expose the NATS config settings via annotations
+    #
+    python - <<-EOF
+    import os
+    import json
+    import sys
+    from jinja2 import Template
+
+    raw = \
+    """
+      port:     4242
+      debug:    false
+      trace:    true
+      logtime:  false
+      log_file: /data/gnatsd.log
+      pid_file: /data/gnatsd.pid
+      
+      cluster {
+        host: '127.0.0.1'
+        port: 4244
+        routes = [
+          {%- for ip in ips %}
+          nats-route://{{ip}}:4242
+          {%- endfor %}
+        ]
+      }
+    """
+
+    #
+    # - render the gnatsd configuration file with the all the routes
+    # - make sure to remove the local IP address
+    # - the configuration settings go to /data/gnatsd.conf
+    #
+    ip = os.environ['KONTROL_IP']
+    js = json.loads(os.environ['INPUT'])
+    js['peers'].remove(ip)
+    with open('/data/gnatsd.conf', 'wb') as fd:
+        fd.write(Template(raw).render(ips=js['peers']))    
+    EOF
+
+    if [ $? -ne 0 ]; then
+      echo "warning, unable to render the configuration file, skipping restart..."
+    else
+      supervisorctl restart gnatsd
+    fi
+
+  next: 
+    - configure
+
+- tag: shutdown
